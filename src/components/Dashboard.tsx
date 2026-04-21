@@ -7,7 +7,8 @@
  * 3. Controlling the visibility and state of the AI live camera feed.
  * 4. Aggregating system-wide statistics for the safety KPI cards.
  */
-
+import * as ort from 'onnxruntime-web';
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
 import { useState, useEffect, useRef } from 'react';
 import { Helmet, Alert, Page } from '../types'; 
 import { RealGoogleMap } from './RealGoogleMap';
@@ -16,8 +17,10 @@ import { CriticalAlertModal } from './CriticalAlertModal';
 import { Sidebar } from './Sidebar';
 import { Users, AlertTriangle, Wifi, Hammer, CheckCircle2, Video, VideoOff, MapPin, Eye, EyeOff, Activity } from 'lucide-react';
 
+
 // Central API Configuration
 const API_URL = 'https://Halm.pythonanywhere.com';
+
 
 interface DashboardProps {
   onNavigate: (page: Page) => void;
@@ -40,9 +43,28 @@ export function Dashboard({ onNavigate, onLogout }: DashboardProps) {
   
   // Camera State: Defaulted to false to ensure privacy and optimize bandwidth on startup
   const [showCamera, setShowCamera] = useState(false);
+  const [session, setSession] = useState<ort.InferenceSession | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const lastAlertSentTime = useRef<number>(0); // لمنع إرسال نفس التنبيه للسيرفر مئة مرة في الثانية
 
   // 🟢 2. عرفنا المتغير اللي بيحفظ آخر تنبيه طلعناه عشان ما يعلق البوب-أب كل ثانيتين
   const lastProcessedAlertId = useRef<string | number | null>(null);
+
+  useEffect(() => {
+  const loadModel = async () => {
+    try {
+      const sess = await ort.InferenceSession.create('/best.onnx', { 
+        executionProviders: ['wasm'] 
+      });
+      setSession(sess);
+      console.log("✅ ONNX Model Loaded in Browser");
+    } catch (e) {
+      console.error("❌ Model Load Error:", e);
+    }
+  };
+  loadModel();
+}, []);
 
   // Persistence: Track camera preference across sessions
   useEffect(() => {
@@ -58,6 +80,65 @@ export function Dashboard({ onNavigate, onLogout }: DashboardProps) {
     resolvedCount: 0 
   });
 
+  const syncAlertWithServer = async (type: string, confidence: number) => {
+    // 1. إنشاء تنبيه "لحظي" لعرضه فوراً أمام اللجنة
+    const instantAlert: Alert = {
+      id: Date.now(), // ID مؤقت
+      helmetId: "AI-EDGE", // الكود اللي في fetchData راح يستخدم هذا الاسم عشان يثبت التنبيه
+      workerName: "Live Operator",
+      type: 'hazard',
+      severity: 'critical',
+      source: "AI Edge",
+      timestamp: new Date(),
+      description: `${type} Detected (Live)`, 
+      resolved: false,
+      message: type, // تأكدي إنه يطابق كلمة Sharp أو Pothole بالضبط
+      time: new Date().toLocaleTimeString(),
+      location: { lat: 25.3463, lng: 49.5937 }
+    };
+
+    // 🟢 تحديث المصفوفة فوراً (بيطلع الإشعار وتتحدث الـ KPIs في نفس اللحظة)
+    setActiveAlerts(prev => [instantAlert, ...prev]);
+    setAllAlerts(prev => [instantAlert, ...prev]);
+    // 2. إرسال البيانات للسيرفر (PythonAnywhere) ليتم حفظها رسمياً
+    try {
+      await fetch(`${API_URL}/api/hardware/alert`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: type, // بيرسل Sharp أو Pothole
+          confidence: confidence
+        })
+      });
+      // نحدث البيانات من السيرفر للتأكد من المزامنة
+      fetchData(); 
+    } catch (error) {
+      console.error("Server Sync Error:", error);
+    }
+  };
+
+
+  const toggleCamera = async () => {
+  const nextState = !showCamera;
+  setShowCamera(nextState);
+
+  if (nextState) {
+    // ننتظر ميلي ثانية ليظهر عنصر الـ video في الصفحة ثم نربطه بالبث
+    setTimeout(async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        if (videoRef.current) videoRef.current.srcObject = stream;
+      } catch (err) {
+        console.error("Camera access denied:", err);
+      }
+    }, 100);
+  } else {
+    // إغلاق الكاميرا لتوفير الطاقة والخصوصية
+    const stream = videoRef.current?.srcObject as MediaStream;
+    stream?.getTracks().forEach(track => track.stop());
+  }
+  };
+  
   /**
    * Data Synchronization Logic:
    * Fetches alerts and worker data simultaneously to maintain a consistent state.
@@ -73,7 +154,7 @@ export function Dashboard({ onNavigate, onLogout }: DashboardProps) {
         const workerData = await workerRes.json();
         setIsConnected(true);
 
-        // Alert Processing: Mapping database records to UI Alert objects
+        // 1. معالجة التنبيهات القادمة من السيرفر (PythonAnywhere)
         const processedAlerts: Alert[] = alertData.map((item: any) => ({
           id: item.id,
           helmetId: `H-${item.id}`,
@@ -90,20 +171,34 @@ export function Dashboard({ onNavigate, onLogout }: DashboardProps) {
         }));
 
         setAllAlerts(processedAlerts);
-        const activeOnly = processedAlerts.filter(a => !a.resolved);
-        setActiveAlerts(activeOnly);
+        
+        // 🟢 التعديل الجوهري: دمج التنبيهات المحلية الحية مع تنبيهات السيرفر
+        setActiveAlerts(prev => {
+          // نحتفظ بالتنبيهات التي مصدرها الكاميرا الحالية فقط
+          // 🟢 المنطق الجديد: نحذف التنبيه المحلي (AI-EDGE) إذا وصل تنبيه بنفس النوع من السيرفر
+          const liveLocalAlerts = prev.filter(a => 
+            a.helmetId === "AI-EDGE" && 
+            !activeServerAlerts.some(s => s.message === a.message)
+          );
+          // نجلب التنبيهات غير المحلولة (Pending) من السيرفر
+          const activeServerAlerts = processedAlerts.filter(a => !a.resolved);
+          
+          // دمج القائمتين
+          const combined = [...liveLocalAlerts, ...activeServerAlerts];
 
-        // ==========================================
-        // 🟢 3. لوجيك الطوارئ: البوب-أب التلقائي للسقوط
-        // ==========================================
+          // منع التكرار بناءً على الوصف (Description) لضمان نظافة القائمة
+          return combined.filter((v, i, a) => 
+            a.findIndex(t => t.description === v.description) === i
+          );
+        });
+
+        // 2. لوجيك الطوارئ: البوب-أب التلقائي للسقوط (كما هو)
         if (processedAlerts.length > 0) {
           const newestAlert = processedAlerts[0]; 
 
           if (!newestAlert.resolved) {
-            // نسحب أرقام التنبيهات اللي سويتي لها تخطي
             const dismissedAlerts = JSON.parse(sessionStorage.getItem('dismissedFalls') || '[]');
 
-            // نتأكد إن الخطر سقوط، وما سوينا له تخطي قبل!
             if (newestAlert.message && newestAlert.message.toLowerCase().includes('fall') && !dismissedAlerts.includes(newestAlert.id)) {
               if (newestAlert.id !== lastProcessedAlertId.current) {
                 lastProcessedAlertId.current = newestAlert.id; 
@@ -112,12 +207,11 @@ export function Dashboard({ onNavigate, onLogout }: DashboardProps) {
             }
           }
         }
-        // ==========================================
 
-        // Helmet Processing: Calculating real-time status based on active alerts
+        // 3. معالجة بيانات العمال ومواقعهم على الخريطة
+        const activeOnly = processedAlerts.filter(a => !a.resolved);
         const formattedHelmets: Helmet[] = workerData.map((w: any) => {
           const hasActiveAlert = activeOnly.some(alert => alert.workerName === w.name);
-          // Simulated offset for visualization if coordinates are identical
           const fixedOffset = (w.id * 0.002) % 0.01; 
 
           return {
@@ -207,6 +301,90 @@ export function Dashboard({ onNavigate, onLogout }: DashboardProps) {
     }
   };
 
+
+
+  const runInference = async () => {
+  if (!session || !videoRef.current || !canvasRef.current || !showCamera) return;
+  const video = videoRef.current;
+  const canvas = canvasRef.current;
+  const ctx = canvas.getContext('2d');
+  if (!ctx || video.videoWidth === 0) return;
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  try {
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = 640; tempCanvas.height = 640;
+    tempCanvas.getContext('2d')?.drawImage(video, 0, 0, 640, 640);
+    const imgData = tempCanvas.getContext('2d')?.getImageData(0, 0, 640, 640);
+    
+    if (imgData) {
+      const input = new Float32Array(3 * 640 * 640);
+      for (let i = 0; i < 640 * 640; i++) {
+        input[i] = imgData.data[i * 4] / 255.0;
+        input[i + 640*640] = imgData.data[i*4 + 1] / 255.0;
+        input[i + 2*640*640] = imgData.data[i*4 + 2] / 255.0;
+      }
+      
+      const tensor = new ort.Tensor('float32', input, [1, 3, 640, 640]);
+      const outputs = await session.run({ images: tensor });
+      const output = outputs[Object.keys(outputs)[0]].data as Float32Array;
+
+      const numClasses = 3; 
+      const numPredictions = output.length / (4 + numClasses);
+      
+      for (let i = 0; i < numPredictions; i++) {
+        const scores = [output[4*numPredictions+i], output[5*numPredictions+i], output[6*numPredictions+i]];
+        const maxConf = Math.max(...scores);
+        const classId = scores.indexOf(maxConf);
+
+        if (maxConf > 0.65) {
+          const x = (output[i] - output[2*numPredictions+i]/2) * (canvas.width/640);
+          const y = (output[numPredictions+i] - output[3*numPredictions+i]/2) * (canvas.height/640);
+          const w = output[2*numPredictions+i] * (canvas.width/640);
+          const h = output[3*numPredictions+i] * (canvas.height/640);
+
+          let label = ""; let color = ""; let textColor = "#FFFFFF";
+          if (classId === 0) { 
+              // الفئة 0: Sharp Tools (أزرق)
+              label = "Sharp Tool (Hazard)"; 
+              color = "#0000FF"; 
+          } 
+          else if (classId === 1) { 
+              // الفئة 1: Potholes (سماوي)
+              label = "Pothole (Hazard)"; 
+              color = "#00FFFF"; 
+              textColor = "#000000"; // نص أسود عشان يوضح فوق السماوي
+          } 
+          else if (classId === 2) { 
+              // الفئة 2: Handheld Tool (أبيض)
+              label = "Handheld Tool (Safe)"; 
+              color = "#FFFFFF"; 
+              textColor = "#000000"; 
+          }
+
+          ctx.strokeStyle = color; ctx.lineWidth = 5;
+          ctx.strokeRect(x, y, w, h);
+          ctx.fillStyle = color;
+          ctx.font = "bold 16px Arial";
+          const txt = `${label} ${(maxConf * 100).toFixed(1)}%`;
+          ctx.fillRect(x, y - 25, ctx.measureText(txt).width + 10, 25);
+          ctx.fillStyle = textColor; ctx.fillText(txt, x + 5, y - 7);
+
+          // 🟢 الربط مع السيرفر وتحديث المصفوفات الأصلية
+          if (label.includes("(Hazard)") && (Date.now() - lastAlertSentTime.current > 8000)) {
+            lastAlertSentTime.current = Date.now();
+            syncAlertWithServer(label.split(' ')[0], Math.round(maxConf * 100));
+          }
+        }
+      }
+    }
+  } catch (err) {}
+  if (showCamera) requestAnimationFrame(runInference);
+  };
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-gray-50 font-sans">
       
@@ -224,7 +402,7 @@ export function Dashboard({ onNavigate, onLogout }: DashboardProps) {
             <div className="flex items-center gap-3">
                {/* Visibility Toggle for AI Video Feed */}
                <button
-                  onClick={() => setShowCamera(!showCamera)}
+                  onClick={toggleCamera}
                   className={`flex h-9 items-center justify-center gap-2 rounded-full border px-4 text-xs font-bold uppercase tracking-wider transition-all hover:opacity-80 ${
                     showCamera ? 'border-gray-200 bg-gray-100 text-gray-600' : 'border-indigo-200 bg-indigo-50 text-indigo-600'
                   }`}
@@ -271,22 +449,22 @@ export function Dashboard({ onNavigate, onLogout }: DashboardProps) {
             <div className="scrollbar-thin flex h-full min-w-0 flex-1 flex-col gap-6 overflow-y-auto pb-20 pr-2">
                {/* AI Camera Feed Panel */}
                {showCamera && (
-                   <div className="relative w-full shrink-0 overflow-hidden rounded-2xl border border-gray-800 bg-black shadow-sm" style={{ height: '400px' }}>
-                       {!cameraError ? (
-                           <img src={`${API_URL}/video_feed`} alt="AI Live Vision" className="h-full w-full bg-black object-contain" onError={() => setCameraError(true)}/>
-                       ) : (
-                           <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900 text-gray-500">
-                                <VideoOff size={48} className="mb-4 opacity-50" />
-                                <p className="font-bold">AI Feed Interrupted: Check Vision Server</p>
-                           </div>
-                       )}
-                       <div className="absolute left-4 top-4 flex gap-2">
-                            <div className="flex animate-pulse items-center gap-2 rounded-md bg-red-600 px-3 py-1 text-xs font-bold text-white shadow-sm">
-                                <span className="h-2 w-2 rounded-full bg-white"></span> LIVE AI VISION
-                            </div>
-                       </div>
-                   </div>
-               )}
+              <div className="relative w-full shrink-0 overflow-hidden rounded-2xl border border-gray-800 bg-black shadow-sm" style={{ height: '400px' }}>
+                <video 
+                  ref={videoRef} 
+                  autoPlay playsInline muted 
+                  className="h-full w-full bg-black object-contain" 
+                  onLoadedMetadata={runInference}
+                />
+                <canvas ref={canvasRef} className="pointer-events-none absolute left-0 top-0 h-full w-full" />
+                <div className="absolute left-4 top-4 flex gap-2">
+                  <div className="flex animate-pulse items-center gap-2 rounded-md bg-red-600 px-3 py-1 text-xs font-bold text-white shadow-sm">
+                    <span className="h-2 w-2 rounded-full bg-white"></span> LIVE AI VISION
+                  </div>
+                  {!session && <div className="rounded bg-yellow-500 px-2 py-1 text-[10px] font-bold text-black">LOADING ENGINE...</div>}
+                </div>
+              </div>
+            )}
 
                {/* Satellite GPS Tracking Panel */}
                <div className="relative flex w-full shrink-0 flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-sm"
