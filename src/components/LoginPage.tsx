@@ -276,7 +276,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
 
         {/* System Credits and Protection Badge */}
         <motion.div transition={{ delay: 1 }} className="mt-6 text-center">
-          <p className="mb-2 text-xs text-slate-400">© 2026 Halm Safety System - KFUPM Collaboration</p>
+          <p className="mb-2 text-xs text-slate-400">© 2026 Halm Safety System</p>
           <div className="flex items-center justify-center gap-2 text-xs text-slate-500">
             <Shield className="h-3 w-3" /> Encrypted Safety Data Transmission Active
           </div>
